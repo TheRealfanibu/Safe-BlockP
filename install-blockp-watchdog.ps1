@@ -124,6 +124,15 @@ $secure = Read-Host "Password / app password for $SmtpUser" -AsSecureString
 $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
 try { $smtpPass = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
 finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+# Google displays app passwords as "abcd efgh ijkl mnop"; the spaces are not part of it.
+$smtpPass = $smtpPass -replace '\s', ''
+if (-not $smtpPass) {
+    # .NET's SmtpClient silently skips AUTH with an empty password, and Gmail then
+    # answers "5.7.0 Authentication Required" - which looks like a server problem.
+    Write-Host 'Empty password (a paste into the hidden prompt can fail silently - try right-click to paste).' -ForegroundColor Red
+    exit 1
+}
+Write-Host "  got a $($smtpPass.Length)-character password"   # Gmail app passwords: 16
 
 function Send-TestMail {
     param([string] $To, [string] $Subject, [string] $Body)
@@ -142,6 +151,10 @@ try {
     Write-Host '  sent.' -ForegroundColor Green
 } catch {
     Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    if ($SmtpHost -eq 'smtp.gmail.com') {
+        Write-Host '  Gmail needs an APP password (Google Account > Security > 2-Step Verification > App passwords),'
+        Write-Host '  not the normal account password, and -SmtpUser must be that account''s full address.'
+    }
     Write-Host '  Without working mail there is no way to get an unlock code. Not installing.'
     exit 1
 }
