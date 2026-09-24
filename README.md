@@ -16,16 +16,84 @@ Its built-in uninstall protection can't survive that. These scripts add the miss
 
 All require an **elevated** PowerShell (right-click → Run as administrator).
 
-Three scripts. Everything else was tried, disproved, and deleted — the reasoning is kept
-below so it doesn't get rebuilt.
+Everything else was tried, disproved, and deleted — the reasoning is kept below so it doesn't
+get rebuilt. Versioned in git; the v4 single-watchdog state is the first commit.
 
 | Script | What it does |
 |---|---|
-| `install-blockp-watchdog.ps1` | Installs/repairs everything (v4). Registers the SYSTEM watchdog task, points both launcher tasks at the interactive user (`Interactive` / `RunLevel Highest`), and writes `watchdog.ps1`. `-RestoreAdmin` also returns the account to Administrators, which BlockP requires. Safe to re-run; use it after a BlockP update resets `BlockPStartup`. |
-| `uninstall-blockp-watchdog.ps1` | Removes the watchdog task, its processes, and its folder. |
-| `diagnose-watchdog.ps1` | Read-only. Task state, exit codes, Task Scheduler events, **whether BlockP is in session 0, whether its PIDs are stable, and whether it is deliberately aborting**. Run this if blocking ever silently stops. |
+| `watchdog.ps1` | The watchdog body (v5). Copied to `C:\ProgramData\BlockPWatchdog` and run twice by SYSTEM, as `-Role A` and `-Role B`. Not run by hand. |
+| `install-blockp-watchdog.ps1` | **First install only.** Takes BlockP's current `config.json` as the baseline to enforce, stores the SMTP login, registers `BlockPWatchdogA`/`B` and both launcher tasks, and removes the old v4 task. Refuses to run once v5 is installed. `-RestoreAdmin` returns the account to Administrators, which BlockP requires. |
+| `uninstall-blockp-watchdog.ps1` | Asks watchdog A for an unlock code, which is mailed to the accountability partner. With the code: removes everything. With `-Rebaseline -Set key=value` and the code: changes protected settings. The partner's mail shows exactly what changes. |
+| `tests\` | `test-config.ps1`, `test-unlock.ps1`: run the watchdog's own functions against scratch files with side effects stubbed. No admin needed. **Run both before installing a changed `watchdog.ps1`.** |
+| `diagnose-watchdog.ps1` | Read-only. Heartbeats, enforced settings compared with `config.json`, task state, Task Scheduler events, **whether BlockP is in session 0, whether its PIDs are stable, and whether it is deliberately aborting**. Run this if blocking ever silently stops. |
 
-## Watchdog design — why it is not one long-running loop
+## v5 — two watchdogs, settings held in RAM, partner code to remove
+
+v4 had one watchdog, and it protected only the process. v5 adds three things.
+
+**Two watchdogs that guard each other.** `BlockPWatchdogA` and `BlockPWatchdogB` both run as
+SYSTEM and poll every second. Each one writes a heartbeat file. If the peer's heartbeat is more
+than 6s old, it restarts the peer. Every 5s it re-registers the peer's task (and its own) if
+the task was deleted or altered, and re-enables it if it was disabled. It also repairs
+`BlockPWatchdogLaunch` and `BlockPStartup`, so a BlockP update that resets `BlockPStartup` no
+longer needs a manual re-install. Both tasks also re-trigger every minute
+(`MultipleInstances IgnoreNew`), so killing both processes costs at most ~60s. A named mutex per
+role stops duplicate copies, and a shared repair mutex keeps A and B from both killing and
+relaunching BlockP at the same moment.
+
+Unlike v2–v4, the processes are long-lived on purpose. The "killed → dead until reboot" problem
+of v1 is covered by the every-minute trigger, and a process that lives for hours can hold state
+in RAM (next point).
+
+**Settings are read once and held in RAM.** At startup, each watchdog reads `state.json`
+(the enforced settings plus a full snapshot of `config.json`), `smtp.bin` and its own
+`watchdog.ps1` into memory. After that the disk only mirrors memory:
+
+- If `config.json` differs from the RAM copy in an enforced key, the watchdog kills BlockP, so
+  BlockP can't write its own in-memory state back on exit. Then it writes the enforced values
+  back, relaunches BlockP, and mails the partner. Deleted or corrupted → restored from the last
+  good copy in RAM (after two bad reads in a row, so BlockP writing the file mid-poll isn't
+  mistaken for tampering).
+- If `watchdog.ps1`, `state.json` or `smtp.bin` are edited or deleted, they're rewritten from RAM
+  within a second.
+- **Enforced:** every top-level scalar in `config.json` (`passProtectionMode`,
+  `preventUninstallMode`, `blockPMode`, all `block*Mode`s, `pornBlockMode`, `aiBlockerMode`,
+  `timeDelayMode`, `accountabilityPartnerEmail`). **Not enforced:** `userId`, `authData`,
+  `ratedVal`, `rateUsDone`, which BlockP rewrites itself. This also works the other way: turning
+  a setting *on* in the UI (for example `timeDelayMode`) is reverted too. Use `-Rebaseline`.
+
+**The partner holds the only way out.** `uninstall-blockp-watchdog.ps1` doesn't remove anything
+itself. It drops a request into `C:\ProgramData\BlockPWatchdog\unlock\`. Watchdog A generates an
+8-digit code, mails it to the partner, and keeps only its SHA-256 hash in RAM; the code is never
+written to disk. Three wrong tries and the code is dead; it expires after 60 minutes, and every
+new request sends a new mail. With the right code, A itself stops B, unregisters all tasks,
+mails the partner that it happened, and deletes its folder. So editing the uninstall script
+achieves nothing: it has no power of its own.
+
+The partner is also mailed (rate-limited to one mail per event type per 30 min) when:
+- BlockP's settings were changed,
+- a watchdog task was deleted, altered or disabled,
+- a watchdog file was edited or deleted,
+- A starts up and finds that **both** heartbeats went stale for >3 min while the PC was on.
+  That can only happen if someone killed both.
+
+### Mail account — read this before installing
+
+The mail that carries the code goes through an SMTP account whose password is stored on this
+PC (`smtp.bin`, LocalMachine DPAPI). Two ways that leaks the code to you:
+
+1. **The Sent folder.** Gmail and Outlook save everything sent over SMTP to Sent. If you can log
+   into the sender mailbox, you can read every code there.
+2. **The stored password.** An admin can decrypt `smtp.bin` (LocalMachine DPAPI protects it only
+   from non-admins). A Gmail app password also grants IMAP access, which leads back to point 1.
+
+So: **the sender account should belong to your partner.** Have them create a separate mailbox,
+turn on 2FA, create the app password, and type it into the installer themselves. Or use a
+transactional relay with a send-only key (e.g. SendGrid SMTP, user `apikey`, host
+`smtp.sendgrid.net`), which has no mailbox to read. Point 2 still means a determined you
+could send mail as that account, but not read the codes.
+
+## Watchdog design history — why v2–v4 were short-lived
 
 v1 was a single infinite loop started once at boot. Killing its process from an elevated Task
 Manager left it dead **until the next reboot**, silently — exit code `0x1`, no log entry,
@@ -100,6 +168,19 @@ protection is off. Self-defeating, so it was not used.
 > the one reason this option was rejected no longer holds — and unelevated-as-yourself is the
 > only known configuration that is compatible with a demoted standard account. Re-test before
 > trusting it in either direction.
+>
+> **Superseded 25.09.2026: `config.json` is back.** `%APPDATA%\BlockP\config.json` exists
+> again, with `passProtectionMode`, `preventUninstallMode`, `blockPMode`, the other
+> `block*Mode`s and `accountabilityPartnerEmail` as plain JSON, `FullControl` for `Jonas`. The
+> original objection holds again, and it is what v5 is for: the watchdogs revert any edit to
+> those keys within a second.
+>
+> **This reopens the demotion option.** Everything v5 needs runs as SYSTEM, and a standard user
+> can't kill, unregister or edit any of it. A standard user *can* edit `config.json`, but v5
+> reverts the edit and mails the partner. So "demoted `Jonas` + BlockP unelevated via
+> `RunAsInvoker` + v5 watchdogs + admin password held by the partner" is the first design where
+> blocking works *and* you can't dismantle it in one command. Not built yet: it needs the launcher
+> tasks at `RunLevel Limited` with the shim, and a re-test that 2.0.6 still blocks unelevated.
 
 ### Therefore
 
@@ -110,14 +191,17 @@ exclusive — pick one.
 ## What you actually get now
 
 - BlockP runs as you, in your session, with your settings, and blocks.
-- The SYSTEM watchdog returns it within ~5 seconds of being killed in Task Manager.
-- **But you are an administrator**, so you can `Unregister-ScheduledTask -TaskName BlockPWatchdog`
-  and nothing restores it.
+- Either watchdog returns it within ~1–20 seconds of being killed in Task Manager.
+- Edits to BlockP's settings are reverted within a second, and your partner hears about it.
+- Killing one watchdog, or deleting or disabling one task, is undone within seconds.
+- The supported way out needs your partner's code.
+- **But you are still an administrator.** One command that disables both tasks and kills both
+  processes, or a Safe Mode boot, still gets past this. What changed from v4: tampering
+  that the watchdogs survive, or catch when they restart, **produces a mail to your partner**. Quietly
+  dismantling it is much harder now; dismantling it at all is not.
 
-That is friction against impulse, not a wall. It is worth having — the five-second relaunch
-defeats the "just kill it for a second" reflex, which is the actual failure mode. It is not
-protection against a deliberate decision to dismantle it, and calling it "hardening" shouldn't
-fool you into thinking otherwise.
+That is still friction, not a wall. The difference from v4 is that the friction now has a
+witness.
 
 ## The layer that survives all of this
 
@@ -131,13 +215,15 @@ this is where to spend effort instead.
 
 ## Health check
 
-The watchdog overwrites a heartbeat file every poll. If it is more than ~90 seconds old,
-the watchdog is not running:
+Each watchdog overwrites its heartbeat file every second. Older than ~6 seconds means that one
+is not running (the other should fix that within seconds):
 
 ```powershell
-Get-Content C:\ProgramData\BlockPWatchdog\heartbeat.txt   # should be seconds old
+Get-ChildItem C:\ProgramData\BlockPWatchdog\heartbeat-*.txt | Select-Object Name, LastWriteTime
 Get-Content C:\ProgramData\BlockPWatchdog\watchdog.log -Tail 20
 ```
+
+Or just run `diagnose-watchdog.ps1`, which also compares the enforced settings to `config.json`.
 
 Worth checking occasionally. Silent failure is the thing to watch for — a blocker that has
 quietly stopped is worse than no blocker, because you think you are covered. That is exactly
@@ -161,36 +247,62 @@ If the PIDs change every few seconds, it is in a crash/restart loop, not running
 - **BlockP resurrects itself.** With `preventUninstallMode`, each instance spawns a successor
   before dying, so a single `Stop-Process` never clears it. You need a kill loop that runs until
   the count stays at zero. Scripts here do this; ad-hoc commands won't.
-- **The watchdog re-enables `BlockPStartup`.** `Disable-ScheduledTask` on it is undone within 60
-  seconds. Disable the watchdog *first* when testing.
-- **`Get-ScheduledTask -TaskName BlockPWatchdog` returns nothing for a standard user.** The task
-  is ACL'd. That is not the task missing — check the heartbeat and the
+- **The watchdogs re-enable `BlockPStartup`** within 5 seconds, and each other within seconds.
+  There is no "disable it for testing" any more short of the partner code. Test changes to
+  `watchdog.ps1` with `tests\` before installing.
+- **`Get-ScheduledTask -TaskName BlockPWatchdogA` returns nothing for a standard user.** The task
+  is ACL'd. That is not the task missing — check the heartbeats and the
   `Microsoft-Windows-TaskScheduler/Operational` log instead.
+- **Never write `config.json` with `Set-Content -Encoding utf8`** in Windows PowerShell 5.1: it
+  adds a BOM, and Electron's `JSON.parse` rejects it. The watchdog writes UTF-8 without a BOM.
+- **The scripts are ASCII-only on purpose.** PowerShell 5.1 reads BOM-less `.ps1` files as ANSI.
 - **Electron's single-instance lock is per user-data dir.** Two instances under the same account
   collide; instances under different accounts do not. A second instance exiting instantly on
   startup usually means the lock, not a crash.
 - **Logging out changes your session id.** Anything that hardcodes a session number breaks.
   Resolve it at runtime with `WTSGetActiveConsoleSessionId`.
-- **A BlockP update can recreate `BlockPStartup`** and undo the repair. The watchdog logs drift;
-  re-run `install-blockp-watchdog.ps1` to fix it.
+- **A BlockP update can recreate `BlockPStartup`.** v5 repairs it automatically within 5s.
+- **A BlockP update that adds or renames a setting** is not enforced until you uninstall (code)
+  and install again; `-Rebaseline` only changes keys that are already enforced. One that
+  *removes* a setting will have it re-added by the watchdog, which is harmless.
 
-## Undoing it
+## Changing settings, or undoing it
+
+Don't change a protected setting in BlockP's UI: the watchdogs revert it within a second and
+mail your partner. Request it instead:
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall-blockp-watchdog.ps1 -Rebaseline -Set timeDelayMode=true
+```
+
+Several at once: `-Set blockGuestMode=false, accountabilityPartnerEmail=new@example.com`. Only
+keys that are already enforced, with the same type. A new partner email also becomes where
+future codes go, but the code for *that* change goes to the current partner.
+
+```powershell
+# Remove the watchdogs entirely (BlockP itself stays installed):
 powershell -ExecutionPolicy Bypass -File .\uninstall-blockp-watchdog.ps1
 ```
 
-That is the whole undo. Since the demotion approach is gone, there is no separate admin account
-or password to recover — which also means there is nothing here that can lock you out, and
-nothing that costs you time on the way back out. Both the strength and the weakness of the
-current setup.
+Both mail your partner a code and wait for you to type it in. With the code, watchdog A writes
+the change into `config.json` and restarts BlockP. Changing the watchdog code itself means
+removing it and installing again.
+
+If mail ever breaks (app password revoked, account locked), there is no code. The exit then is
+the manual one described under "Honest limits". It is loud on purpose.
 
 ## Honest limits
 
 You have physical access to this machine, so none of this is absolute. Safe mode, recovery
 media, an offline password reset, or just a different device all defeat it given enough
-determination. And since BlockP forces the daily account to stay an administrator, the watchdog
-is now removable by you in one command.
+determination. And since BlockP forces the daily account to stay an administrator, one elevated
+command that disables both watchdog tasks *and* kills both processes in the same breath still
+gets past v5. The next start of watchdog A mails the partner only if A ever starts again.
+LocalMachine DPAPI and the ACL on `C:\ProgramData\BlockPWatchdog` do not stop an administrator.
+They only stop casual reading.
+
+The demotion design under "What BlockP will and will not tolerate" is what would turn this
+into a wall on the PC side.
 
 The goal is **friction and delay**, which is what actually works against impulse — not an
 unbreakable wall. The router layer is the only part of this that a determined five minutes at
@@ -198,5 +310,6 @@ the keyboard cannot undo.
 
 ## Log
 
-`C:\ProgramData\BlockPWatchdog\watchdog.log` — every relaunch is timestamped there. Worth
+`C:\ProgramData\BlockPWatchdog\watchdog.log`: every relaunch, repair, notice and unlock
+request is timestamped there, tagged `[A]` or `[B]`. Worth
 reading occasionally; the pattern of *when* you try is more useful information than the count.

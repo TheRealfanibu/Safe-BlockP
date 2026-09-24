@@ -1,95 +1,183 @@
 #Requires -RunAsAdministrator
 <#
-  Installs/repairs the BlockP watchdog (v4).
+  Installs the BlockP watchdog (v5): two SYSTEM watchdogs, A and B, that guard
+  BlockP, BlockP's settings, and each other. See README.md.
 
-  BlockP runs as the interactive user, in their own session, under their own
-  profile, guarded by a SYSTEM scheduled task that relaunches it within ~5s of
-  being killed. This is the only configuration BlockP 2.0.6 actually tolerates.
+  First install only. Once v5 is running, this script refuses: changing anything
+  goes through uninstall-blockp-watchdog.ps1, which needs a code mailed to your
+  accountability partner (-Rebaseline to accept new BlockP settings, no switch to
+  remove everything).
 
-  WHY (established empirically on 14.09.2026):
-    BlockP 2.0.6 aborts with STATUS_BREAKPOINT (0x80000003) whenever it runs as an
-    account that is not the interactive session owner. Verified as WinAdmin in
-    session 0 and in session 3, with a fresh profile, with and without --disable-gpu,
-    with a correctly elevated token and the profile loaded. The same binary run as
-    the session owner is stable and blocks correctly. It is a deliberate abort, so
-    no launcher work gets around it.
+  What it needs from you:
+    - BlockP set up the way you want it protected. Its CURRENT config.json becomes
+      the baseline the watchdogs enforce.
+    - An SMTP account that can send mail. Read the README section "Mail account"
+      first: if YOU can log into that mailbox, you can read the unlock code in
+      its Sent folder.
 
-    BlockP.exe is also requireAdministrator, so the session owner must be an admin.
-    That is the trade this script makes, and it is a REAL trade:
-
-      you get : blocking that works, and relaunch within ~5s of being killed
-      you lose: the guarantee that you cannot dismantle it. As an administrator you
-                can unregister BlockPWatchdog and nothing restores it.
-
-    Friction and delay, not a wall - which is what README.md already claims is the
-    actual goal. But do not tell yourself it is more than that.
-
-  Run with -RestoreAdmin to actually change group membership. Without that flag
-  this only reports what it would do and repairs the tasks.
+  Example (Gmail with an app password; you are prompted for the password):
+    .\install-blockp-watchdog.ps1 -SmtpUser blockp.watchdog.xyz@gmail.com
 #>
 
 param(
     [string] $User         = 'Jonas',
+    [string] $PartnerEmail,                       # default: accountabilityPartnerEmail from BlockP
+    [string] $SmtpHost     = 'smtp.gmail.com',
+    [int]    $SmtpPort     = 587,
+    [Parameter(Mandatory)] [string] $SmtpUser,
+    [string] $SmtpFrom,                           # default: SmtpUser
     [switch] $RestoreAdmin,
     [switch] $IncludeArbeit
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
 
 $exePath    = 'C:\Program Files\BlockP\BlockP.exe'
 $root       = 'C:\ProgramData\BlockPWatchdog'
 $scriptPath = Join-Path $root 'watchdog.ps1'
-$watchTask  = 'BlockPWatchdog'
+$statePath  = Join-Path $root 'state.json'
+$smtpPath   = Join-Path $root 'smtp.bin'
+$unlockDir  = Join-Path $root 'unlock'
 $launchTask = 'BlockPWatchdogLaunch'
 $startTask  = 'BlockPStartup'
+$legacyTask = 'BlockPWatchdog'
+$volatile   = @('userId', 'authData', 'ratedVal', 'rateUsDone')
+$utf8NoBom  = New-Object System.Text.UTF8Encoding $false
+if (-not $SmtpFrom) { $SmtpFrom = $SmtpUser }
 
+$source = Join-Path $PSScriptRoot 'watchdog.ps1'
 if (-not (Test-Path $exePath)) { throw "BlockP.exe not found at $exePath" }
+if (-not (Test-Path $source))  { throw "watchdog.ps1 not found next to this script ($source)" }
 
-Write-Host '== Restoring BlockP to a working configuration ==' -ForegroundColor Cyan
-Write-Host ''
+Write-Host '== BlockP watchdog v5 install ==' -ForegroundColor Cyan
 
-# ---------------------------------------------------------------- current state
-$isAdmin = $false
-try {
-    $isAdmin = [bool](Get-LocalGroupMember -Group 'Administratoren' -ErrorAction Stop |
-                      Where-Object { $_.Name -like "*\$User" })
-} catch {
-    $isAdmin = [bool](Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue |
-                      Where-Object { $_.Name -like "*\$User" })
+# ------------------------------------------------------------- already there?
+if ((Get-ScheduledTask -TaskName 'BlockPWatchdogA' -ErrorAction SilentlyContinue) -or
+    (Get-ScheduledTask -TaskName 'BlockPWatchdogB' -ErrorAction SilentlyContinue)) {
+    Write-Host ''
+    Write-Host 'v5 is already installed. Changes go through the partner code:' -ForegroundColor Yellow
+    Write-Host '  .\uninstall-blockp-watchdog.ps1 -Rebaseline   # accept current BlockP settings as the new baseline'
+    Write-Host '  .\uninstall-blockp-watchdog.ps1               # remove it, then re-run this installer'
+    exit 1
 }
+
+# ------------------------------------------------------------ admin membership
+$adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+$isAdmin = [bool](Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*\$User" })
 Write-Host "$User is currently an administrator: $isAdmin"
 
-if (-not $isAdmin -and -not $RestoreAdmin) {
-    Write-Host ''
-    Write-Host "$User is a standard user, so BlockP.exe cannot elevate and WILL NOT RUN." -ForegroundColor Yellow
-    Write-Host 'Re-run with -RestoreAdmin to put the account back in Administrators.' -ForegroundColor Yellow
-    Write-Host 'Repairing the tasks anyway so they are correct once that happens.' -ForegroundColor Yellow
-}
-
-# ------------------------------------------------------------ restore admin
 if ($RestoreAdmin) {
     $targets = @($User)
     if ($IncludeArbeit) { $targets += 'Arbeit' }
     foreach ($t in $targets) {
-        $grp = 'Administratoren'
-        if (-not (Get-LocalGroup -Name $grp -ErrorAction SilentlyContinue)) { $grp = 'Administrators' }
-        if (Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*\$t" }) {
-            Write-Host "  $t is already in $grp"
+        if (Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*\$t" }) {
+            Write-Host "  $t is already in $adminGroup"
         } else {
-            Add-LocalGroupMember -Group $grp -Member $t
-            Write-Host "  added $t to $grp" -ForegroundColor Green
+            Add-LocalGroupMember -Group $adminGroup -Member $t
+            Write-Host "  added $t to $adminGroup" -ForegroundColor Green
         }
     }
     Write-Host '  NOTE: sign out and back in for the new token to take effect.' -ForegroundColor Yellow
+} elseif (-not $isAdmin) {
+    Write-Host "$User is a standard user, so BlockP.exe cannot elevate and WILL NOT RUN. Use -RestoreAdmin." -ForegroundColor Yellow
 }
 
-# ------------------------------------------- clear the crash-looping instances
-# BlockP resurrects itself (preventUninstallMode), so one kill is never enough.
+# --------------------------------------------------------- baseline from BlockP
+$sid = (New-Object Security.Principal.NTAccount $User).Translate([Security.Principal.SecurityIdentifier]).Value
+$profilePath = (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'").LocalPath
+if (-not $profilePath) { throw "No profile found for $User ($sid)" }
+$configPath = Join-Path $profilePath 'AppData\Roaming\BlockP\config.json'
+if (-not (Test-Path $configPath)) { throw "BlockP config not found at $configPath - start BlockP and sign in first" }
+
+$raw = [IO.File]::ReadAllText($configPath, $utf8NoBom)
+$cfg = $raw.TrimStart([char]0xFEFF) | ConvertFrom-Json
+
+# Every top-level scalar except the ones BlockP legitimately rewrites on its own.
+# Later changes go through uninstall-blockp-watchdog.ps1 -Rebaseline -Set key=value.
+$enforced = [ordered] @{}
+foreach ($p in $cfg.PSObject.Properties) {
+    if ($volatile -contains $p.Name) { continue }
+    if ($p.Value -isnot [bool] -and $p.Value -isnot [string] -and $p.Value -isnot [int] -and $p.Value -isnot [long]) { continue }
+    $enforced[$p.Name] = $p.Value
+}
+
+if (-not $PartnerEmail) { $PartnerEmail = $cfg.accountabilityPartnerEmail }
+if (-not $PartnerEmail) { throw 'No partner email: pass -PartnerEmail or set one in BlockP first' }
+
 Write-Host ''
-Write-Host 'clearing stale BlockP processes...'
-foreach ($t in $watchTask, $startTask, $launchTask) {
+Write-Host 'These settings will be enforced (changes are reverted within ~1s):' -ForegroundColor Cyan
+foreach ($k in $enforced.Keys) {
+    $v = $enforced[$k]
+    $color = if ($v -is [bool] -and -not $v -and $k -ne 'timeDelayMode') { 'Yellow' } else { 'Gray' }
+    Write-Host ("  {0,-28} = {1}" -f $k, $v) -ForegroundColor $color
+}
+Write-Host "Not enforced (BlockP rewrites these): $($volatile -join ', ')"
+Write-Host "Unlock codes and tamper notices go to: $PartnerEmail"
+Write-Host ''
+Write-Host 'Anything you want changed later needs a code from that person.' -ForegroundColor Yellow
+if ((Read-Host 'Type YES to lock this in') -cne 'YES') { Write-Host 'Aborted.'; exit 1 }
+
+# -------------------------------------------------------------------- SMTP
+Write-Host ''
+$secure = Read-Host "Password / app password for $SmtpUser" -AsSecureString
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+try { $smtpPass = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+
+function Send-TestMail {
+    param([string] $To, [string] $Subject, [string] $Body)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $client = New-Object Net.Mail.SmtpClient($SmtpHost, $SmtpPort)
+    $client.EnableSsl   = $true
+    $client.Timeout     = 20000
+    $client.Credentials = New-Object Net.NetworkCredential($SmtpUser, $smtpPass)
+    $msg = New-Object Net.Mail.MailMessage($SmtpFrom, $To, $Subject, $Body)
+    try { $client.Send($msg) } finally { $msg.Dispose(); $client.Dispose() }
+}
+
+Write-Host "sending a test mail to $SmtpFrom ..."
+try {
+    Send-TestMail -To $SmtpFrom -Subject 'BlockP watchdog: SMTP test' -Body 'If you can read this, the watchdog can send mail.'
+    Write-Host '  sent.' -ForegroundColor Green
+} catch {
+    Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host '  Without working mail there is no way to get an unlock code. Not installing.'
+    exit 1
+}
+
+if ((Read-Host "Also send $PartnerEmail a short 'you are my accountability partner for this' mail? (y/N)") -eq 'y') {
+    try {
+        Send-TestMail -To $PartnerEmail -Subject 'BlockP: you are my accountability partner' -Body @"
+Hi,
+
+I set up a watchdog on my PC ($env:COMPUTERNAME) that keeps my BlockP blocker running
+and its settings locked. If I ever want to remove it or change its settings, it will
+mail YOU an 8-digit code, and I need that code from you.
+
+You will also get a mail if it detects that someone tried to tamper with it.
+
+Only give me a code if you agree with what I am asking for.
+"@
+        Write-Host '  sent.' -ForegroundColor Green
+    } catch { Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Yellow }
+}
+
+# ---------------------------------------------------- stop legacy + BlockP
+Write-Host ''
+if (Get-ScheduledTask -TaskName $legacyTask -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $legacyTask -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $legacyTask -Confirm:$false
+    Write-Host "  removed legacy v4 task '$legacyTask'"
+}
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+    Where-Object { $_.CommandLine -match 'BlockPWatchdog\\watchdog\.ps1' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+foreach ($t in $startTask, $launchTask) {
     try { Disable-ScheduledTask -TaskName $t -ErrorAction Stop | Out-Null } catch { }
 }
+Write-Host 'clearing BlockP processes...'
 $deadline = (Get-Date).AddSeconds(45); $zero = 0; $kills = 0
 while ((Get-Date) -lt $deadline) {
     $p = @(Get-Process -Name 'BlockP' -ErrorAction SilentlyContinue)
@@ -99,146 +187,72 @@ while ((Get-Date) -lt $deadline) {
 }
 Write-Host "  $kills kills, field clear=$($zero -ge 6)"
 
-# --------------------------------------------------------- watchdog body (v4)
-# v4 change from v3: the launch task targets the INTERACTIVE USER, not WinAdmin.
-# v3 ran BlockP as WinAdmin "whether logged on or not", which puts it in session 0
-# with WinAdmin's profile - where it blocks nothing and aborts on sight.
-$body = @'
-# Runs as SYSTEM, re-launched every minute by Task Scheduler.
-# Polls for ~55s then exits 0. Never loops forever.
-$ErrorActionPreference = 'SilentlyContinue'
-
-$exePath    = 'C:\Program Files\BlockP\BlockP.exe'
-$launchTask = 'BlockPWatchdogLaunch'
-$root       = 'C:\ProgramData\BlockPWatchdog'
-$logFile    = Join-Path $root 'watchdog.log'
-$beatFile   = Join-Path $root 'heartbeat.txt'
-$pollSec    = 5
-$runSec     = 55
-
-function Write-Log {
-    param([string]$Message)
-    try {
-        if ((Test-Path $logFile) -and ((Get-Item $logFile).Length -gt 1MB)) {
-            $keep = Get-Content $logFile -Tail 500
-            Set-Content -Path $logFile -Value $keep -Encoding utf8
-        }
-        Add-Content -Path $logFile -Encoding utf8 -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
-    } catch { }
-}
-
-function Get-InteractiveUser {
-    $p = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Select-Object -First 1
-    if (-not $p) { return $null }
-    $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner
-    if (-not $o.User) { return $null }
-    if ($o.Domain) { return "$($o.Domain)\$($o.User)" }
-    return $o.User
-}
-
-# The launch task must target whoever is actually logged on, with RunLevel Highest.
-# BlockP.exe is requireAdministrator AND aborts (0x80000003) if it is not the
-# session owner - so "elevated, as the logged-on user" is the only thing it accepts.
-function Confirm-LaunchTask {
-    param([string]$User)
-    $existing = Get-ScheduledTask -TaskName $launchTask -ErrorAction SilentlyContinue
-    $needs = $true
-    if ($existing) {
-        $userOk = $existing.Principal.UserId -and
-                  ($existing.Principal.UserId.Split('\')[-1] -eq $User.Split('\')[-1])
-        if ($userOk -and $existing.Principal.RunLevel -eq 'Highest') { $needs = $false }
-    }
-    if ($needs) {
-        try {
-            $action    = New-ScheduledTaskAction -Execute $exePath -Argument '--hidden'
-            $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
-            $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-            Register-ScheduledTask -TaskName $launchTask -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-            Write-Log "(re)registered $launchTask for $User"
-        } catch {
-            Write-Log "ERROR registering ${launchTask}: $($_.Exception.Message)"
-            return $false
-        }
-    }
-    if ((Get-ScheduledTask -TaskName $launchTask -ErrorAction SilentlyContinue).State -eq 'Disabled') {
-        Enable-ScheduledTask -TaskName $launchTask | Out-Null
-        Write-Log "Re-enabled $launchTask"
-    }
-    return $true
-}
-
-$deadline = (Get-Date).AddSeconds($runSec)
-
-while ((Get-Date) -lt $deadline) {
-    try {
-        Set-Content -Path $beatFile -Encoding utf8 -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-
-        $user = Get-InteractiveUser
-        if ($user) {
-            $running = @(Get-Process -Name 'BlockP' -ErrorAction SilentlyContinue)
-            if ($running.Count -eq 0) {
-                Write-Log "BlockP not running (session: $user) - relaunching"
-                if (Confirm-LaunchTask -User $user) {
-                    Start-ScheduledTask -TaskName $launchTask
-                    Start-Sleep -Seconds 15
-                }
-            }
-        }
-    }
-    catch {
-        Write-Log "ERROR: $($_.Exception.Message)"
-    }
-    Start-Sleep -Seconds $pollSec
-}
-
-exit 0
-'@
-
+# ------------------------------------------------------------------- files
+if (Test-Path $root) { & icacls.exe $root /reset /t /q | Out-Null }
 New-Item -ItemType Directory -Path $root -Force | Out-Null
-Set-Content -Path $scriptPath -Value $body -Encoding utf8
-Write-Host ''
-Write-Host "  wrote $scriptPath (v4 - launches as the interactive user)"
+New-Item -ItemType Directory -Path $unlockDir -Force | Out-Null
+Get-ChildItem $root -Filter 'heartbeat-*.txt' | Remove-Item -Force   # no false "were stopped" mail
 
-# --------------------------------------------------- repair the launcher tasks
-$action    = New-ScheduledTaskAction -Execute $exePath -Argument '--hidden'
-$principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
-$settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-Register-ScheduledTask -TaskName $launchTask -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-Write-Host "  repaired '$launchTask' -> $User / Interactive / Highest"
+Copy-Item $source $scriptPath -Force
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $User
-Register-ScheduledTask -TaskName $startTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-Write-Host "  repaired '$startTask'  -> $User / Interactive / Highest / at logon"
+$state = [ordered] @{
+    version      = 5
+    user         = $User
+    configPath   = $configPath
+    partnerEmail = $PartnerEmail
+    enforced     = $enforced
+    volatileKeys = $volatile
+    snapshot     = [Convert]::ToBase64String($utf8NoBom.GetBytes($raw))
+    installedAt  = (Get-Date).ToString('s')
+}
+[IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 32), $utf8NoBom)
 
-# ------------------------------------------------------- re-register watchdog
-$wAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
-$tBoot   = New-ScheduledTaskTrigger -AtStartup
-$tRep    = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 1)
-$wPrin   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-$wSet    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-              -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew `
-              -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-Register-ScheduledTask -TaskName $watchTask -Action $wAction -Trigger @($tBoot, $tRep) -Principal $wPrin -Settings $wSet -Force | Out-Null
-Enable-ScheduledTask -TaskName $watchTask | Out-Null
-Start-ScheduledTask  -TaskName $watchTask
-Write-Host "  re-registered + started '$watchTask' (SYSTEM, every 1 min)"
+# LocalMachine DPAPI: SYSTEM can decrypt it. So can any admin who goes looking -
+# this keeps the password out of plain sight, nothing more.
+$smtpJson = [ordered] @{ host = $SmtpHost; port = $SmtpPort; user = $SmtpUser; pass = $smtpPass; from = $SmtpFrom } | ConvertTo-Json
+$blob = [Security.Cryptography.ProtectedData]::Protect($utf8NoBom.GetBytes($smtpJson), $null, 'LocalMachine')
+[IO.File]::WriteAllBytes($smtpPath, $blob)
+$smtpPass = $null; $smtpJson = $null
 
-# ------------------------------------------------------------- start BlockP
-if ($isAdmin -or $RestoreAdmin) {
-    Start-ScheduledTask -TaskName $launchTask
-    Start-Sleep -Seconds 8
-    $p = @(Get-Process -Name 'BlockP' -ErrorAction SilentlyContinue)
-    Write-Host ''
-    if ($p.Count -gt 0) {
-        Write-Host "BlockP is running: $($p.Count) process(es)" -ForegroundColor Green
-        Write-Host 'Go test a blocked site.' -ForegroundColor Green
-    } else {
-        Write-Host 'BlockP did not come up.' -ForegroundColor Yellow
-        Write-Host "If you just ran -RestoreAdmin, sign out and back in first - $User's"
-        Write-Host 'current token is still a standard-user token until then.'
-    }
+# SYSTEM + Administrators only. Standard users (and a demoted future you) get nothing.
+& icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /q | Out-Null
+Write-Host "  wrote $root (watchdog.ps1, state.json, smtp.bin)"
+
+# ------------------------------------------------------------------- tasks
+$action = New-ScheduledTaskAction -Execute $exePath -Argument '--hidden'
+$prin   = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+$set    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName $launchTask -Action $action -Principal $prin -Settings $set -Force | Out-Null
+Register-ScheduledTask -TaskName $startTask -Action $action -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $User) -Principal $prin -Settings $set -Force | Out-Null
+Write-Host "  '$launchTask' and '$startTask' -> $User / Interactive / Highest"
+
+foreach ($r in 'A', 'B') {
+    $wAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Role $r"
+    $tBoot = New-ScheduledTaskTrigger -AtStartup
+    $tRep  = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 1)
+    $wPrin = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $wSet  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+                -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+    Register-ScheduledTask -TaskName "BlockPWatchdog$r" -Action $wAction -Trigger @($tBoot, $tRep) -Principal $wPrin -Settings $wSet -Force | Out-Null
+    Start-ScheduledTask -TaskName "BlockPWatchdog$r"
+    Write-Host "  registered + started 'BlockPWatchdog$r' (SYSTEM)"
 }
 
+# ------------------------------------------------------------------ verify
+Start-Sleep -Seconds 10
 Write-Host ''
-Write-Host 'Health check:  Get-Content C:\ProgramData\BlockPWatchdog\heartbeat.txt'
-Write-Host 'Log:           C:\ProgramData\BlockPWatchdog\watchdog.log'
+foreach ($r in 'A', 'B') {
+    $hb = Join-Path $root "heartbeat-$r.txt"
+    $age = if (Test-Path $hb) { [int] ((Get-Date) - (Get-Item $hb).LastWriteTime).TotalSeconds } else { $null }
+    if ($null -ne $age -and $age -lt 6) { Write-Host "watchdog $r alive (heartbeat ${age}s old)" -ForegroundColor Green }
+    else { Write-Host "watchdog $r NOT alive - check $root\watchdog.log" -ForegroundColor Red }
+}
+$p = @(Get-Process -Name 'BlockP' -ErrorAction SilentlyContinue)
+if ($p.Count -gt 0) { Write-Host "BlockP running: $($p.Count) process(es). Go test a blocked site." -ForegroundColor Green }
+else { Write-Host 'BlockP not up yet - the watchdogs will start it within ~20s. If you just ran -RestoreAdmin, sign out and in first.' -ForegroundColor Yellow }
+
+Write-Host ''
+Write-Host 'Health:  Get-Content C:\ProgramData\BlockPWatchdog\heartbeat-A.txt, heartbeat-B.txt'
+Write-Host 'Log:     C:\ProgramData\BlockPWatchdog\watchdog.log'

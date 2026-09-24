@@ -1,36 +1,52 @@
 #Requires -RunAsAdministrator
-# Why did the BlockPWatchdog task stop? Read-only diagnostic.
+# Health of the v5 watchdogs (A + B), the launcher tasks, and BlockP itself. Read-only.
 
 $ErrorActionPreference = 'Continue'
-$task = 'BlockPWatchdog'
+$root = 'C:\ProgramData\BlockPWatchdog'
 
-Write-Host '===== TASK STATE ====='
+Write-Host '===== HEARTBEATS ====='
+foreach ($r in 'A', 'B') {
+    $hb = Join-Path $root "heartbeat-$r.txt"
+    if (Test-Path $hb) {
+        $age = [int] ((Get-Date) - (Get-Item $hb).LastWriteTime).TotalSeconds
+        $color = if ($age -lt 6) { 'Green' } else { 'Red' }
+        Write-Host ("watchdog {0}: heartbeat {1}s old  ({2})" -f $r, $age, (Get-Content $hb)) -ForegroundColor $color
+    } else { Write-Host "watchdog ${r}: no heartbeat file" -ForegroundColor Red }
+}
+
+Write-Host ''
+Write-Host '===== ENFORCED SETTINGS vs config.json ====='
+try {
+    $state = [IO.File]::ReadAllText((Join-Path $root 'state.json')) | ConvertFrom-Json
+    $cfg   = [IO.File]::ReadAllText($state.configPath).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    foreach ($p in $state.enforced.PSObject.Properties) {
+        $have = $cfg.PSObject.Properties[$p.Name]
+        $ok = $have -and ([string] $have.Value -ceq [string] $p.Value)
+        $color = if ($ok) { 'Gray' } else { 'Red' }
+        Write-Host ("  {0,-28} want {1,-6} have {2}" -f $p.Name, $p.Value, $(if ($have) { $have.Value } else { '(missing)' })) -ForegroundColor $color
+    }
+    "partner: $($state.partnerEmail)   installed: $($state.installedAt)"
+} catch { Write-Host "could not compare: $($_.Exception.Message)" -ForegroundColor Yellow }
+
+foreach ($task in 'BlockPWatchdogA', 'BlockPWatchdogB') {
+Write-Host ''
+Write-Host "===== TASK $task ====="
 $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-if (-not $t) { Write-Host 'TASK DOES NOT EXIST'; return }
+if (-not $t) { Write-Host 'TASK DOES NOT EXIST' -ForegroundColor Red; continue }
 "State        : $($t.State)"
 "Principal    : $($t.Principal.UserId) / $($t.Principal.LogonType) / $($t.Principal.RunLevel)"
 "Triggers     : $(($t.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ', ')"
+"Arguments    : $($t.Actions[0].Arguments)"
 
 $i = Get-ScheduledTaskInfo -TaskName $task
 "LastRunTime  : $($i.LastRunTime)"
 "LastResult   : 0x{0:X8} ({0})" -f $i.LastTaskResult
-"NumberOfMissedRuns: $($i.NumberOfMissedRuns)"
 "NextRunTime  : $($i.NextRunTime)"
+"ExecutionTimeLimit: $($t.Settings.ExecutionTimeLimit)   MultipleInstances: $($t.Settings.MultipleInstances)"
+}
 
 Write-Host ''
-Write-Host '===== SETTINGS THAT CAN KILL A LONG-RUNNING TASK ====='
-$s = $t.Settings
-"ExecutionTimeLimit      : $($s.ExecutionTimeLimit)"
-"MultipleInstances       : $($s.MultipleInstances)"
-"DisallowStartIfOnBatteries: $($s.DisallowStartIfOnBatteries)"
-"StopIfGoingOnBatteries  : $($s.StopIfGoingOnBatteries)"
-"IdleSettings.StopOnIdleEnd: $($s.IdleSettings.StopOnIdleEnd)"
-"RestartCount            : $($s.RestartCount)"
-"RestartInterval         : $($s.RestartInterval)"
-"AllowHardTerminate      : $($s.AllowHardTerminate)"
-
-Write-Host ''
-Write-Host '===== TASK SCHEDULER EVENTS FOR THIS TASK ====='
+Write-Host '===== TASK SCHEDULER EVENTS ====='
 try {
     Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -MaxEvents 400 -ErrorAction Stop |
         Where-Object { $_.Message -match 'BlockPWatchdog' } |
@@ -49,7 +65,7 @@ foreach ($lt in 'BlockPWatchdogLaunch', 'BlockPStartup') {
     $li = Get-ScheduledTaskInfo -TaskName $lt
     "$lt : State=$($lTask.State) User=$($lTask.Principal.UserId) RunLevel=$($lTask.Principal.RunLevel) LastResult=0x{0:X8}" -f $li.LastTaskResult
     if ($li.LastTaskResult -eq 2147943140) {
-        "  -> ERROR_ELEVATION_REQUIRED: this task's user has no admin token. BlockP.exe is requireAdministrator, so the interactive user MUST be in Administrators. Add them back, or re-run install-blockp-watchdog.ps1 -RestoreAdmin."
+        "  -> ERROR_ELEVATION_REQUIRED: this task's user has no admin token. BlockP.exe is requireAdministrator, so the interactive user MUST be in Administrators. Add them back to the Administrators group."
     }
 }
 
@@ -66,7 +82,7 @@ if ($procs.Count -eq 0) {
     if ($sessions -contains 0) {
         Write-Host '  -> SESSION 0: that copy has no desktop and blocks NOTHING.' -ForegroundColor Red
         Write-Host '     A launcher task set to "run whether user is logged on or not" causes this.'
-        Write-Host '     Re-run install-blockp-watchdog.ps1 to point it at the interactive user.'
+        Write-Host '     The watchdogs re-point BlockPWatchdogLaunch at the interactive user within 5s.'
     }
     # A stable PID set is the difference between "running" and "crash-looping".
     Start-Sleep -Seconds 4
@@ -89,5 +105,5 @@ try {
 } catch { Write-Host 'no matching events.' }
 
 Write-Host ''
-Write-Host '===== RAW TASK XML ====='
-Export-ScheduledTask -TaskName $task
+Write-Host '===== LAST LOG LINES ====='
+Get-Content (Join-Path $root 'watchdog.log') -Tail 25 -ErrorAction SilentlyContinue
