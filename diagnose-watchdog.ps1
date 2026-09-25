@@ -1,18 +1,24 @@
 #Requires -RunAsAdministrator
-# Health of the v5 watchdogs (A + B), the launcher tasks, and BlockP itself. Read-only.
+# Health of the v6 watchdogs (A, B, C, ...), the launcher tasks, and BlockP itself. Read-only.
 
 $ErrorActionPreference = 'Continue'
 $root = 'C:\ProgramData\BlockPWatchdog'
+$watchTasks = @(Get-ScheduledTask -TaskName 'BlockPWatchdog?' -ErrorAction SilentlyContinue |
+    Where-Object { $_.TaskName -match '^BlockPWatchdog[A-P]$' } | Sort-Object TaskName)
+$roles = if ($watchTasks) { $watchTasks | ForEach-Object { $_.TaskName[-1] } } else { 'A', 'B' }
 
-Write-Host '===== HEARTBEATS ====='
-foreach ($r in 'A', 'B') {
+Write-Host "===== HEARTBEATS ($($watchTasks.Count) watchdog tasks) ====="
+foreach ($r in $roles) {
     $hb = Join-Path $root "heartbeat-$r.txt"
     if (Test-Path $hb) {
         $age = [int] ((Get-Date) - (Get-Item $hb).LastWriteTime).TotalSeconds
-        $color = if ($age -lt 6) { 'Green' } else { 'Red' }
+        $color = if ($age -lt 4) { 'Green' } else { 'Red' }
         Write-Host ("watchdog {0}: heartbeat {1}s old  ({2})" -f $r, $age, (Get-Content $hb)) -ForegroundColor $color
     } else { Write-Host "watchdog ${r}: no heartbeat file" -ForegroundColor Red }
 }
+$procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match 'BlockPWatchdog\\watchdog\.ps1' })
+$mb = [int] (($procs | ForEach-Object { (Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue).PrivateMemorySize64 } | Measure-Object -Sum).Sum / 1MB)
+"watchdog processes: $($procs.Count), $mb MB private memory in total"
 
 Write-Host ''
 Write-Host '===== ENFORCED SETTINGS vs config.json ====='
@@ -28,14 +34,14 @@ try {
     "partner: $($state.partnerEmail)   installed: $($state.installedAt)"
 } catch { Write-Host "could not compare: $($_.Exception.Message)" -ForegroundColor Yellow }
 
-foreach ($task in 'BlockPWatchdogA', 'BlockPWatchdogB') {
+foreach ($task in ($roles | ForEach-Object { "BlockPWatchdog$_" })) {
 Write-Host ''
 Write-Host "===== TASK $task ====="
 $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
 if (-not $t) { Write-Host 'TASK DOES NOT EXIST' -ForegroundColor Red; continue }
 "State        : $($t.State)"
 "Principal    : $($t.Principal.UserId) / $($t.Principal.LogonType) / $($t.Principal.RunLevel)"
-"Triggers     : $(($t.Triggers | ForEach-Object { $_.CimClass.CimClassName }) -join ', ')"
+"Triggers     : $(($t.Triggers | ForEach-Object { $_.CimClass.CimClassName + $(if ($_.StartBoundary) { " @ $($_.StartBoundary)" }) }) -join ', ')"
 "Arguments    : $($t.Actions[0].Arguments)"
 
 $i = Get-ScheduledTaskInfo -TaskName $task

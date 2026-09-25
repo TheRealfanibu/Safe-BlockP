@@ -23,9 +23,8 @@ $script:mails = @(); $script:did = @(); $script:notices = @()
 function Send-Mail { param($To, $Subject, $Body) $script:mails += [pscustomobject] @{ To = $To; Body = $Body }; $true }
 function Send-Notice { param($Kind, $Text) if (-not $suppressNotice) { $script:notices += $Kind } }
 function Invoke-Uninstall { $script:did += 'uninstall' }
-function Get-WatchdogProcesses { param($ForRole) }
-function Stop-ScheduledTask { param($TaskName) $script:did += "stop:$TaskName" }
-function Start-ScheduledTask { param($TaskName) $script:did += "start:$TaskName" }
+function Stop-OtherWatchdogs { $script:did += 'stopOthers' }
+function Start-OtherWatchdogs { $script:did += 'startOthers' }
 function Stop-BlockP { $script:did += 'stopBlockP'; $true }
 function Start-BlockP { param([switch] $Force) $script:did += 'startBlockP' }
 function Enter-Repair { param($TimeoutMs) $true }
@@ -75,7 +74,7 @@ $s = Try-Code (LastCode)
 $cfg = [IO.File]::ReadAllText($cfgPath) | ConvertFrom-Json
 $st  = [IO.File]::ReadAllText($statePath) | ConvertFrom-Json
 Check 'status done' ($s.status -eq 'done')
-Check 'B stopped before, started after' (($did -join ',') -match '^stop:BlockPWatchdogB,.*start:BlockPWatchdogB$')
+Check 'others stopped before, started after' (($did -join ',') -match '^stopOthers,.*startOthers$')
 Check 'config.json updated, BlockP restarted' ($cfg.timeDelayMode -eq $true -and $cfg.accountabilityPartnerEmail -eq 'new@example.com' -and $did -contains 'startBlockP')
 Check 'state.json updated (enforced + partner)' ($st.enforced.timeDelayMode -eq $true -and $st.partnerEmail -eq 'new@example.com')
 Check 'RAM copy matches new state.json' ($null -ne $ram.State -and [Convert]::ToBase64String($ram.State) -eq [Convert]::ToBase64String([IO.File]::ReadAllBytes($statePath)))

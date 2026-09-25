@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 <#
-  Removes the BlockP watchdog (v5), or with -Rebaseline changes protected settings.
+  Removes the BlockP watchdogs (v5/v6), or with -Rebaseline changes protected settings.
   Either way it needs a code that watchdog A mails to your accountability partner.
   The code is never written to disk: A keeps only its hash in memory.
 

@@ -1,9 +1,9 @@
 #Requires -RunAsAdministrator
 <#
-  Installs the BlockP watchdog (v5): two SYSTEM watchdogs, A and B, that guard
-  BlockP, BlockP's settings, and each other. See README.md.
+  Installs the BlockP watchdog (v6): -Count SYSTEM watchdogs (A, B, C, ...) that
+  guard BlockP, BlockP's settings, and each other. See README.md.
 
-  First install only. Once v5 is running, this script refuses: changing anything
+  First install only. Once installed, this script refuses: changing anything
   goes through uninstall-blockp-watchdog.ps1, which needs a code mailed to your
   accountability partner (-Rebaseline to accept new BlockP settings, no switch to
   remove everything).
@@ -26,6 +26,7 @@ param(
     [int]    $SmtpPort     = 587,
     [Parameter(Mandatory)] [string] $SmtpUser,
     [string] $SmtpFrom,                           # default: SmtpUser
+    [ValidateRange(2, 16)] [int] $Count = 6,      # ~100 MB RAM each
     [switch] $RestoreAdmin,
     [switch] $IncludeArbeit
 )
@@ -50,13 +51,12 @@ $source = Join-Path $PSScriptRoot 'watchdog.ps1'
 if (-not (Test-Path $exePath)) { throw "BlockP.exe not found at $exePath" }
 if (-not (Test-Path $source))  { throw "watchdog.ps1 not found next to this script ($source)" }
 
-Write-Host '== BlockP watchdog v5 install ==' -ForegroundColor Cyan
+Write-Host '== BlockP watchdog v6 install ==' -ForegroundColor Cyan
 
 # ------------------------------------------------------------- already there?
-if ((Get-ScheduledTask -TaskName 'BlockPWatchdogA' -ErrorAction SilentlyContinue) -or
-    (Get-ScheduledTask -TaskName 'BlockPWatchdogB' -ErrorAction SilentlyContinue)) {
+if (Get-ScheduledTask -TaskName 'BlockPWatchdog?' -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match '^BlockPWatchdog[A-P]$' }) {
     Write-Host ''
-    Write-Host 'v5 is already installed. Changes go through the partner code:' -ForegroundColor Yellow
+    Write-Host 'The watchdogs are already installed. Changes go through the partner code:' -ForegroundColor Yellow
     Write-Host '  .\uninstall-blockp-watchdog.ps1 -Rebaseline   # accept current BlockP settings as the new baseline'
     Write-Host '  .\uninstall-blockp-watchdog.ps1               # remove it, then re-run this installer'
     exit 1
@@ -209,7 +209,7 @@ Get-ChildItem $root -Filter 'heartbeat-*.txt' | Remove-Item -Force   # no false 
 Copy-Item $source $scriptPath -Force
 
 $state = [ordered] @{
-    version      = 5
+    version      = 6
     user         = $User
     configPath   = $configPath
     partnerEmail = $PartnerEmail
@@ -239,24 +239,29 @@ Register-ScheduledTask -TaskName $launchTask -Action $action -Principal $prin -S
 Register-ScheduledTask -TaskName $startTask -Action $action -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $User) -Principal $prin -Settings $set -Force | Out-Null
 Write-Host "  '$launchTask' and '$startTask' -> $User / Interactive / Highest"
 
-foreach ($r in 'A', 'B') {
+# Same as Register-WatchdogTask in watchdog.ps1. The every-minute triggers are staggered
+# by 60/Count seconds, so after a kill-all one of them is back within that time.
+$roles = @(0..($Count - 1) | ForEach-Object { [string] [char] (65 + $_) })
+$slot  = [int] [math]::Floor(60 / $Count)
+for ($i = 0; $i -lt $Count; $i++) {
+    $r = $roles[$i]
     $wAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Role $r"
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Role $r -Count $Count"
     $tBoot = New-ScheduledTaskTrigger -AtStartup
-    $tRep  = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 1)
+    $tRep  = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds($i * $slot) -RepetitionInterval (New-TimeSpan -Minutes 1)
     $wPrin = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $wSet  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
                 -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
     Register-ScheduledTask -TaskName "BlockPWatchdog$r" -Action $wAction -Trigger @($tBoot, $tRep) -Principal $wPrin -Settings $wSet -Force | Out-Null
     Start-ScheduledTask -TaskName "BlockPWatchdog$r"
-    Write-Host "  registered + started 'BlockPWatchdog$r' (SYSTEM)"
+    Write-Host ("  registered + started 'BlockPWatchdog$r' (SYSTEM, re-triggered at :{0:D2} every minute)" -f ($i * $slot))
 }
 
 # ------------------------------------------------------------------ verify
 Start-Sleep -Seconds 10
 Write-Host ''
-foreach ($r in 'A', 'B') {
+foreach ($r in $roles) {
     $hb = Join-Path $root "heartbeat-$r.txt"
     $age = if (Test-Path $hb) { [int] ((Get-Date) - (Get-Item $hb).LastWriteTime).TotalSeconds } else { $null }
     if ($null -ne $age -and $age -lt 6) { Write-Host "watchdog $r alive (heartbeat ${age}s old)" -ForegroundColor Green }
@@ -267,5 +272,5 @@ if ($p.Count -gt 0) { Write-Host "BlockP running: $($p.Count) process(es). Go te
 else { Write-Host 'BlockP not up yet - the watchdogs will start it within ~20s. If you just ran -RestoreAdmin, sign out and in first.' -ForegroundColor Yellow }
 
 Write-Host ''
-Write-Host 'Health:  Get-Content C:\ProgramData\BlockPWatchdog\heartbeat-A.txt, heartbeat-B.txt'
+Write-Host 'Health:  .\diagnose-watchdog.ps1'
 Write-Host 'Log:     C:\ProgramData\BlockPWatchdog\watchdog.log'

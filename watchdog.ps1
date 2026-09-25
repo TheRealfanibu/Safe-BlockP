@@ -1,24 +1,26 @@
 <#
-  BlockP watchdog v5. Runs as SYSTEM, twice: -Role A and -Role B.
+  BlockP watchdog v6. Runs as SYSTEM, -Count times: -Role A, B, C, ...
 
   Each instance is long-lived and, every second:
     - keeps BlockP running as the interactive user
     - enforces the protected keys of BlockP's config.json from a copy held in RAM
     - restores its own files (this script, state.json, smtp.bin) from RAM if touched
-    - restarts its peer if the peer's heartbeat goes stale
-  and every 5 seconds re-registers / re-enables any task that was removed or altered.
+    - restarts EVERY other watchdog whose process is gone
+  and every 5 seconds re-registers / re-enables its own task and the next role's task.
 
   Role A additionally handles the unlock protocol (uninstall / rebaseline need a code
-  that is mailed to the accountability partner) and sends tamper notices.
+  that is mailed to the accountability partner). Tamper notices are sent by the
+  lowest-lettered watchdog that is alive, so one event is one mail.
 
-  Task Scheduler re-triggers both tasks every minute (MultipleInstances IgnoreNew), so
-  killing both processes costs at most ~60 seconds, and a named mutex keeps each role
-  a singleton.
+  Task Scheduler re-triggers every task every minute (MultipleInstances IgnoreNew), and
+  the triggers are staggered by 60/Count seconds, so killing all processes at once
+  costs at most 60/Count seconds. A named mutex keeps each role a singleton.
 
   ASCII only: Windows PowerShell 5.1 reads BOM-less scripts as ANSI.
 #>
 param(
-    [ValidateSet('A', 'B')] [string] $Role = 'A'
+    [ValidatePattern('^[A-P]$')] [string] $Role = 'A',
+    [ValidateRange(2, 16)] [int] $Count = 2
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -33,14 +35,18 @@ $logFile    = Join-Path $root 'watchdog.log'
 $unlockDir  = Join-Path $root 'unlock'
 $launchTask = 'BlockPWatchdogLaunch'
 $startTask  = 'BlockPStartup'
-$peerRole   = if ($Role -eq 'A') { 'B' } else { 'A' }
+$roles      = @(0..($Count - 1) | ForEach-Object { [string] [char] (65 + $_) })
+$roleIndex  = [array]::IndexOf($roles, $Role)
+if ($roleIndex -lt 0) { exit 0 }                     # a role outside the army: not ours
+$others     = @($roles | Where-Object { $_ -ne $Role })
+$nextRole   = $roles[($roleIndex + 1) % $Count]
 $beatFile   = Join-Path $root "heartbeat-$Role.txt"
-$peerBeat   = Join-Path $root "heartbeat-$peerRole.txt"
 
 $pollMs          = 1000
 $taskCheckSec    = 5
-$peerStaleSec    = 6
-$peerGraceSec    = 20
+$peerStaleSec    = 3
+$peerGraceSec    = 10
+$allDownSec      = 10
 $relaunchGapSec  = 20
 $noticeGapMin    = 30
 $codeValidMin    = 60
@@ -155,12 +161,12 @@ function Send-Mail {
 }
 
 function Send-Notice {
-    # Tamper notices go to the partner. Only A sends, unless A is down, so one event
-    # does not produce two mails. Rate-limited per kind, in RAM.
+    # Tamper notices go to the partner. Only the leader sends, so one event does not
+    # produce one mail per watchdog. Rate-limited per kind, in RAM.
     param([string] $Kind, [string] $Text)
     Write-Log "NOTICE ($Kind): $Text"
     if (-not $state -or $suppressNotice) { return }
-    if ($Role -eq 'B' -and (Test-PeerAlive)) { return }
+    if (-not (Test-IsLeader)) { return }
     $now = Get-Date
     if ($lastNotice.ContainsKey($Kind) -and ($now - $lastNotice[$Kind]).TotalMinutes -lt $noticeGapMin) { return }
     $lastNotice[$Kind] = $now
@@ -178,37 +184,89 @@ accountability partner. No action is needed unless you want to talk about it.
 
 # ------------------------------------------------------------------- peer
 
-function Test-PeerAlive {
+function Test-RoleAlive {
+    # Alive = fresh heartbeat, or a stale one whose process still exists. The second case
+    # is a watchdog busy in a slow repair or a mail, not a killed one.
+    param([string] $ForRole)
+    $f = Join-Path $root "heartbeat-$ForRole.txt"
     try {
-        $age = ((Get-Date) - (Get-Item $peerBeat -ErrorAction Stop).LastWriteTime).TotalSeconds
-        return ($age -lt $peerStaleSec)
+        if (((Get-Date) - (Get-Item $f -ErrorAction Stop).LastWriteTime).TotalSeconds -lt $peerStaleSec) { return $true }
+        $procId = [int] ([IO.File]::ReadAllText($f).Split(' ')[0])
+        return [bool] (Get-Process -Id $procId -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq 'powershell' })
     } catch { return $false }
 }
 
-function Get-WatchdogProcesses {
-    param([string] $ForRole)
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -match 'BlockPWatchdog\\watchdog\.ps1' -and $_.CommandLine -match "-Role $ForRole" }
+function Test-IsLeader {
+    # The lowest-lettered live watchdog speaks for all of them.
+    foreach ($r in $roles) {
+        if ($r -eq $Role) { return $true }
+        if (Test-RoleAlive $r) { return $false }
+    }
+    return $true
 }
 
-$peerStartedAt = [datetime]::MinValue
+function Get-WatchdogProcesses {
+    # Every watchdog process except this one.
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.CommandLine -match 'BlockPWatchdog\\watchdog\.ps1' -and $_.ProcessId -ne $PID }
+}
 
-function Confirm-Peer {
-    if (Test-PeerAlive) { return }
-    if (((Get-Date) - $peerStartedAt).TotalSeconds -lt $peerGraceSec) { return }
-    $script:peerStartedAt = Get-Date
-    Write-Log "peer $peerRole heartbeat stale - starting it"
-    Start-ScheduledTask -TaskName "BlockPWatchdog$peerRole"
+$peerStartedAt = @{}     # role -> when this process last started it
+$seenAlive     = @{}     # roles seen alive since then; dying after that = killed
+$quietUntil    = [datetime]::MinValue
+
+function Confirm-Peers {
+    # Every watchdog restarts every other one, so killing them one by one in Task
+    # Manager loses against the respawns.
+    $killed = @()
+    foreach ($r in $others) {
+        if (Test-RoleAlive $r) { $seenAlive[$r] = $true; continue }
+        if ($peerStartedAt.ContainsKey($r) -and ((Get-Date) - $peerStartedAt[$r]).TotalSeconds -lt $peerGraceSec) { continue }
+        $peerStartedAt[$r] = Get-Date
+        if ($seenAlive[$r]) { $killed += $r; $seenAlive[$r] = $false }
+        Write-Log "peer $r is down - starting it"
+        Start-ScheduledTask -TaskName "BlockPWatchdog$r"
+    }
+    if ($killed.Count -and (Get-Date) -gt $quietUntil) {
+        Send-Notice 'watchdog killed' "Watchdog process(es) $($killed -join ', ') were killed while running. They have been restarted."
+    }
+}
+
+function Stop-OtherWatchdogs {
+    # For rebaseline and uninstall: the others hold the old state in RAM and would
+    # revert the change. Kill and disable in a loop until a pass finds nobody, so a
+    # watchdog started by its trigger or by a dying peer cannot slip through.
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
+        $p = @(Get-WatchdogProcesses)
+        $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+        foreach ($r in $others) { Disable-ScheduledTask -TaskName "BlockPWatchdog$r" | Out-Null }
+        if ($p.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 300
+    }
+}
+
+function Start-OtherWatchdogs {
+    foreach ($r in $others) {
+        Enable-ScheduledTask -TaskName "BlockPWatchdog$r" | Out-Null
+        Start-ScheduledTask -TaskName "BlockPWatchdog$r"
+    }
+    # They were stopped on purpose: no "killed" notice while they come back.
+    $seenAlive.Clear()
+    $script:quietUntil = (Get-Date).AddSeconds(30)
 }
 
 # ------------------------------------------------------------------- tasks
 
 function Register-WatchdogTask {
+    # Same as the installer: the every-minute trigger is offset by the role's slot, so
+    # after a kill-all some watchdog is back within 60/Count seconds.
     param([string] $ForRole)
+    $offset = [array]::IndexOf($roles, $ForRole) * [int] [math]::Floor(60 / $Count)
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Role $ForRole"
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Role $ForRole -Count $Count"
     $tBoot  = New-ScheduledTaskTrigger -AtStartup
-    $tRep   = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 1)
+    $tRep   = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddSeconds($offset) -RepetitionInterval (New-TimeSpan -Minutes 1)
     $prin   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $set    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
@@ -224,7 +282,7 @@ function Confirm-WatchdogTask {
     $ok = $t -and
           ($t.Principal.UserId -match 'SYSTEM') -and
           ($t.Actions.Count -eq 1) -and
-          ($t.Actions[0].Arguments -like "*$scriptPath*-Role $ForRole*") -and
+          ($t.Actions[0].Arguments -like "*$scriptPath*-Role $ForRole -Count $Count") -and
           ($t.Triggers.Count -ge 2)
     if (-not $ok) {
         try {
@@ -304,6 +362,12 @@ function Start-BlockP {
     if (Confirm-LauncherTask -Name $launchTask -User $user) {
         $script:lastLaunch = Get-Date
         Start-ScheduledTask -TaskName $launchTask
+        # Callers hold the repair mutex. Keep it until BlockP shows up, or every other
+        # watchdog sees zero processes the moment it gets the mutex and launches again.
+        $deadline = (Get-Date).AddSeconds(5)
+        while ((Get-Date) -lt $deadline -and @(Get-Process -Name 'BlockP' -ErrorAction SilentlyContinue).Count -eq 0) {
+            Start-Sleep -Milliseconds 250
+        }
     }
 }
 
@@ -453,9 +517,8 @@ function Invoke-Rebaseline {
     param($Changes)
     $summary = Format-Changes $Changes
 
-    # Stop B first: it still holds the old state in RAM and would revert both files.
-    Get-WatchdogProcesses -ForRole 'B' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-    Stop-ScheduledTask -TaskName 'BlockPWatchdogB'
+    # Stop the others first: they still hold the old state in RAM and would revert both files.
+    Stop-OtherWatchdogs
 
     foreach ($k in $Changes.Keys) { $state.enforced.$k = $Changes[$k] }
     if ($Changes.Contains('accountabilityPartnerEmail')) { $state.partnerEmail = $Changes['accountabilityPartnerEmail'] }
@@ -467,19 +530,19 @@ function Invoke-Rebaseline {
     $script:suppressNotice = $true
     try { Test-Config } finally { $script:suppressNotice = $false }
 
-    Start-ScheduledTask -TaskName 'BlockPWatchdogB'
+    Start-OtherWatchdogs
     Write-Log "rebaselined:`n$summary"
     return $summary
 }
 
 function Invoke-Uninstall {
     Write-Log 'uninstall authorised by partner code - standing down'
-    Get-WatchdogProcesses -ForRole 'B' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-    foreach ($t in 'BlockPWatchdogB', 'BlockPWatchdogA', 'BlockPWatchdogLaunch') {
-        Stop-ScheduledTask -TaskName $t
-        Unregister-ScheduledTask -TaskName $t -Confirm:$false
-    }
-    Get-WatchdogProcesses -ForRole 'B' | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    Stop-OtherWatchdogs
+    foreach ($r in $others) { Unregister-ScheduledTask -TaskName "BlockPWatchdog$r" -Confirm:$false }
+    Stop-ScheduledTask -TaskName $launchTask
+    Unregister-ScheduledTask -TaskName $launchTask -Confirm:$false
+    # This process's own task goes last, at the very end of the script: stopping a
+    # running task terminates its process, which would cut the clean-up short.
 }
 
 function Invoke-Unlock {
@@ -591,16 +654,17 @@ $standDown = $false
 $suppressNotice = $false
 Write-Log "started (pid $PID)"
 
-# Were both watchdogs down while the machine was up? That only happens when someone
-# killed them, so it is worth a mail.
-if ($Role -eq 'A' -and $state) {
+# Were ALL watchdogs down while the machine was up? The staggered triggers bring one
+# back within 60/Count seconds, so a longer gap means someone killed them all (and
+# probably disabled the tasks). Whoever starts first reports it.
+if ($state) {
     try {
-        $beats = @($beatFile, $peerBeat) | Where-Object { Test-Path $_ } | ForEach-Object { (Get-Item $_).LastWriteTime }
+        $beats = $roles | ForEach-Object { Join-Path $root "heartbeat-$_.txt" } | Where-Object { Test-Path $_ } | ForEach-Object { (Get-Item $_).LastWriteTime }
         $newest = $beats | Sort-Object -Descending | Select-Object -First 1
         $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-        if ($newest -and $newest -gt $boot -and ((Get-Date) - $newest).TotalMinutes -gt 3) {
-            $mins = [int] ((Get-Date) - $newest).TotalMinutes
-            Send-Notice 'watchdogs were stopped' "Both watchdogs were not running for about $mins minutes (since $($newest.ToString('HH:mm'))) while the PC was on."
+        $gap = if ($newest) { ((Get-Date) - $newest).TotalSeconds } else { 0 }
+        if ($newest -gt $boot -and $gap -gt ([math]::Floor(60 / $Count) + $allDownSec)) {
+            Send-Notice 'watchdogs were stopped' "All $Count watchdogs were not running for about $([int] $gap) seconds (since $($newest.ToString('HH:mm:ss'))) while the PC was on."
         }
     } catch { }
 }
@@ -617,13 +681,15 @@ while (-not $standDown) {
         Confirm-OwnFiles
         Test-Config
         Confirm-BlockPRunning
-        Confirm-Peer
+        Confirm-Peers
 
         if ((Get-Date) -ge $nextTaskCheck) {
+            # Own task + the next one round the ring: every task has two guardians,
+            # without every watchdog querying every task.
             $nextTaskCheck = (Get-Date).AddSeconds($taskCheckSec)
-            Confirm-WatchdogTask -ForRole $peerRole
             Confirm-WatchdogTask -ForRole $Role
-            if ($state) { [void] (Confirm-LauncherTask -Name $startTask -User $state.user -AtLogon) }
+            Confirm-WatchdogTask -ForRole $nextRole
+            if ($state -and (Test-IsLeader)) { [void] (Confirm-LauncherTask -Name $startTask -User $state.user -AtLogon) }
         }
     } catch {
         Write-Log "ERROR: $($_.Exception.Message)"
@@ -631,9 +697,10 @@ while (-not $standDown) {
     Start-Sleep -Milliseconds $pollMs
 }
 
+try { $roleMutex.ReleaseMutex() } catch { }
 if ($standDown) {
     Start-Sleep -Seconds 2
     Remove-Item $root -Recurse -Force
+    Unregister-ScheduledTask -TaskName "BlockPWatchdog$Role" -Confirm:$false
 }
-try { $roleMutex.ReleaseMutex() } catch { }
 exit 0
