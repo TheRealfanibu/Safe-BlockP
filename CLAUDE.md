@@ -15,10 +15,12 @@ No build step. The tests need no admin rights and don't touch the live install:
 powershell -ExecutionPolicy Bypass -File tests\test-config.ps1
 powershell -ExecutionPolicy Bypass -File tests\test-unlock.ps1
 powershell -ExecutionPolicy Bypass -File tests\test-peers.ps1
+powershell -ExecutionPolicy Bypass -File tests\test-update.ps1
 ```
 
 Each prints `name ... PASS/FAIL` lines. None of them sets an exit code, so check the output for `FAIL`.
-Run all three after any change to `watchdog.ps1`.
+Run all four after any change to `watchdog.ps1`. `test-update.ps1` checks real Authenticode
+signatures, so it needs BlockP (or its updater cache) installed.
 
 How the tests work: they parse `watchdog.ps1` with the PowerShell AST, dot-source only the
 functions they name (so the main loop never runs), stub the side effects (`Send-Mail`,
@@ -42,22 +44,26 @@ Install locks the machine, and removal needs a code emailed to the accountabilit
 - **State is loaded into RAM once at startup** (`state.json` = enforced keys + base64 snapshot
   of `config.json`, `smtp.bin` = LocalMachine-DPAPI SMTP creds, and the script's own bytes).
   After that, disk only mirrors RAM: edits to any of these files are reverted. So **editing the
-  installed `watchdog.ps1` in place doesn't work**. Changes ship through uninstall (partner
-  code) + reinstall.
+  installed `watchdog.ps1` in place doesn't work**. From v6.1, changes to the script alone ship
+  through `upgrade-blockp-watchdog.ps1` (partner code, `upgrade` unlock action). Changes to
+  `state.json`, `smtp.bin` or the task definitions still need uninstall + reinstall. Never add
+  a code-free upgrade path: it would also be a code-free uninstall.
 - Main loop (1 s): heartbeat file `heartbeat-<Role>.txt` (`"<pid> <time>"`) → `Invoke-Unlock`
   (a no-op except on A) → `Confirm-OwnFiles` → `Test-Config` → `Confirm-BlockPRunning` →
-  `Confirm-Peers`. Every 5 s it runs `Confirm-WatchdogTask` on its own role and the next role
+  `Confirm-Peers`. `Test-Config` and `Confirm-BlockPRunning` are skipped while
+  `Test-UpdatePause` sees a NovaFocus-signed setup from `blockp-updater` (capped). Every 5 s it runs `Confirm-WatchdogTask` on its own role and the next role
   in the ring, and the leader also repairs `BlockPStartup` (`Confirm-LauncherTask`). At
   startup it sends a "watchdogs were stopped" notice if every heartbeat is older than
   `60/Count + 10` s.
 - **Peers:** a role counts as dead only if its heartbeat is >3 s old *and* its PID is gone
-  (`Test-RoleAlive`). The lowest live letter is the leader (`Test-IsLeader`). Only the leader
+  (`Test-RoleAlive`; an unreadable heartbeat counts as alive) *and* no watchdog process has
+  `-Role X` on its command line (`Test-RoleProcess`). The lowest live letter is the leader (`Test-IsLeader`). Only the leader
   sends notices and repairs `BlockPStartup`. `Global\BlockPWatchdogRepair` serialises
   kill/relaunch of BlockP between roles.
 - **Unlock protocol (role A only):** the uninstall script writes `unlock\request.json` and
   `unlock\attempt.txt`. A answers through `unlock\status.json` (`code-sent`, `wrong`,
   `accepted`, `done`, …). The code is mailed and only its SHA-256 is kept in RAM. The
-  uninstall script has no power of its own. For rebaseline and uninstall, A calls
+  uninstall script has no power of its own. For rebaseline, upgrade and uninstall, A calls
   `Stop-OtherWatchdogs` (kill + disable in a loop) first, so no peer keeps stale state in RAM.
 - BlockP is launched through tasks `BlockPWatchdogLaunch` / `BlockPStartup`, as the interactive
   user with `LogonType Interactive`, `RunLevel Highest`. It *must* be the interactive session

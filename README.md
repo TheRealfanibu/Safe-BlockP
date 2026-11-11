@@ -67,6 +67,8 @@ The installer only runs once. After that, every change goes through the partner 
 - **Your partner gets an email** (no more than one per type of event every 30 min) when:
   settings were changed, a watchdog was killed, a watchdog task was deleted, altered or
   disabled, a watchdog file was edited, or all watchdogs had been stopped.
+- **BlockP updates itself.** While its signed update installer runs, the watchdogs stop
+  restarting BlockP (at most 5 minutes per run, 10 per hour), so the update can finish.
 - **A BlockP update** that recreates its startup task is fixed automatically. An update that
   *adds or renames* a setting: the new setting isn't locked until you remove the watchdogs
   (with a code) and install again.
@@ -99,9 +101,23 @@ script does nothing: watchdog A does the work.
 If mail is broken (for example, the app password was revoked), no code can be sent. There
 is no quiet way out then. See [Limits](#limits).
 
-**Upgrading** to a new version of `watchdog.ps1` works the same way: remove the watchdogs
-(code), then install again. Swapping the file in place doesn't work: the watchdogs hold their
-own copy in memory and put the old one back.
+## Upgrading the watchdog
+
+From v6.1 on, a new `watchdog.ps1` goes in without uninstalling:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\upgrade-blockp-watchdog.ps1
+```
+
+Your partner gets one email naming the old and new version with their SHA-256, plus the
+code. With the code, the watchdogs restart on the new file within a few seconds, and no
+"killed" or "stopped" alarms go out. The code installs only the exact file you staged, so
+tell your partner what changed. Copying the file over by hand still doesn't work: the
+watchdogs hold their own copy in memory and put it back.
+
+If the new version needs different locked settings, a different partner or mail account, or
+different tasks, use remove + install instead. **Going from v6 to v6.1** also needs remove +
+install once, because v6 doesn't know about upgrades.
 
 ## Is it still working?
 

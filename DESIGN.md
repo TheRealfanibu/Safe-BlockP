@@ -12,6 +12,57 @@ BlockP is a plain Electron app with **no Windows service and no kernel driver**.
 `Jonas`, and `Jonas` is a local Administrator, so Task Manager kills it with no UAC prompt.
 Its built-in uninstall protection can't survive that. These scripts add the missing layers.
 
+## v6.1 — BlockP's updater, false kill alarms, in-place upgrade (11.11.2026)
+
+**Restart loop after sign-in.** Symptom: after a sign-in BlockP kept restarting, showing its
+blocking screen, until a sign-out and sign-in. First suspected: a BlockP update rewriting
+`config.json` and the watchdogs reverting it. **Disproved:** `watchdog.log` (30.10–11.11) has
+no `BlockP settings changed` entry at all, and `config.json` was last written 20.10. The
+watchdogs only kill BlockP in a config repair, so they never killed it. They only relaunched it
+after it exited by itself. (The watchdogs also don't snapshot the config at start; they
+enforce the install-time `state.json`, and sign-out doesn't restart them.)
+
+What the PC showed instead: BlockP 2.0.12 installed (16.10) and **2.1.3 downloaded on 05.11 and
+never installed** (`%LOCALAPPDATA%\blockp-updater\pending\`). BlockP uses electron-updater
+(NSIS): to install, it quits BlockP and runs the setup, which has to close every `BlockP.exe`
+and replace the files. A watchdog sees zero BlockP processes and relaunches the old exe within
+a second, which breaks the install, and BlockP tries again on its next start. This is the
+leading explanation, **not proven**: the log can't show what ran during a loop, and why a
+sign-out ends it is still open.
+
+Fix: while a **genuine** BlockP setup runs, the watchdogs skip relaunch and config repair
+(`Test-UpdatePause`). "Genuine" = an exe under some user's `AppData\Local\blockp-updater\`
+**and** a valid Authenticode signature with `CN=NovaFocus LLC` (2.1.3's setup, the cached
+`installer.exe` and `BlockP.exe` are all signed that way). After the setup exits, 15 s of grace
+lets it start BlockP itself. Running the genuine setup by hand still only gets 5 min per run and
+10 min per rolling hour; past that, enforcement resumes and the partner is mailed. The signed
+`Uninstall BlockP.exe` in Program Files does **not** pause anything.
+
+Side note: `LastBootUpTime` was 16.10 on 11.11. With Fast Startup, "shut down" doesn't restart
+the watchdogs, so they can run for weeks on one RAM copy.
+
+**False "watchdog killed" alarms.** The log showed one or two of these an hour, with no matching
+restart. Cause: a peer reads the PID only when the heartbeat is >3 s old (owner busy in a slow
+step). If it catches the file while the owner rewrites it, `ReadAllText` returns `''`, `[int]''`
+is `0`, PID 0 is `Idle`, not `powershell`, so the peer counts as killed. The reader also held
+the file without write sharing, which is where the `heartbeat-X.txt ... von einem anderen Prozess
+verwendet` errors came from. Now: reads share write access, an unreadable or unparsable
+heartbeat is read again and otherwise counts as alive, and before reporting a death `Confirm-Peers`
+looks for a watchdog process with `-Role X` on its command line. Only a missing file or a
+missing process counts as dead.
+
+**In-place upgrade.** `upgrade-blockp-watchdog.ps1` (= `uninstall-blockp-watchdog.ps1 -Upgrade`)
+stages the new `watchdog.ps1` in `unlock\` and asks A for an `upgrade` code. A reads the staged
+bytes into RAM at request time, checks they are ASCII, parse, differ from the running version
+and match the requested SHA-256, and mails the partner both versions with their SHA-256. With the
+code it stops the others, writes the new script, updates its RAM copy, writes `upgraded.txt`
+(new hash + time) and starts the others; then A exits and they restart A. New watchdogs that
+find a mark matching their own hash and <2 min old skip kill notices for 60 s, and the
+"all were stopped" check. No code-free upgrade on purpose: whatever is installed is trusted, so a
+code-free upgrade is a code-free uninstall. It doesn't touch `state.json`, `smtp.bin` or the
+task definitions. Changes to those still need uninstall + install. v6 itself doesn't know
+`upgrade`, so getting to v6.1 takes one uninstall + install.
+
 ## v6 — an army instead of a pair
 
 With two watchdogs it was easy to kill both in Task Manager before either noticed, and after
@@ -214,6 +265,10 @@ with the watchdogs guarding `config.json`.)
 - **Logging out changes your session id.** Anything that hardcodes a session number breaks.
   Resolve it at runtime with `WTSGetActiveConsoleSessionId`.
 - **A BlockP update can recreate `BlockPStartup`.** v5 repairs it automatically within 5s.
+- **BlockP's own updater needs BlockP gone while it installs.** Relaunching under it broke the
+  2.1.3 install for a week (05.–11.11.2026). v6.1 pauses for signed setups (see above).
+- **`[int]''` is `0` in PowerShell, and PID 0 exists (`Idle`).** Never parse a PID from a file
+  that might be mid-write without `[int]::TryParse` and a check for `> 0`.
 - **A BlockP update that adds or renames a setting** is not enforced until you uninstall (code)
   and install again; `-Rebaseline` only changes keys that are already enforced. One that
   *removes* a setting will have it re-added by the watchdog, which is harmless.

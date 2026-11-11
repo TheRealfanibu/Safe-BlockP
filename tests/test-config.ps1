@@ -84,10 +84,12 @@ $events = @(); Test-Config
 Check '5 string "true" instead of bool is caught' ($events -contains 'stop')
 
 # 6. key removed entirely
+# (Uses an enforced key that exists: blockPMode, the old choice, is gone from 2.0.12's config.)
+$gone = @($enforced.Keys | Where-Object { $enforced[$_] -is [bool] })[0]
 $o = [IO.File]::ReadAllText($cfgPath) | ConvertFrom-Json
-$o.PSObject.Properties.Remove('blockPMode')
+$o.PSObject.Properties.Remove($gone)
 [IO.File]::WriteAllText($cfgPath, ($o | ConvertTo-Json -Depth 32))
 $events = @(); Test-Config
-Check '6 removed key is re-added' ((([IO.File]::ReadAllText($cfgPath) | ConvertFrom-Json).blockPMode) -eq $true)
+Check "6 removed key ($gone) is re-added" ((([IO.File]::ReadAllText($cfgPath) | ConvertFrom-Json).$gone) -eq $enforced[$gone])
 
 Remove-Item $cfgPath
